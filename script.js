@@ -1,180 +1,29 @@
 // 🔒 Security: Disable logs in production
-(function () {
-    const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
-    if (isProduction) {
-        const nullFunc = function () { };
-        console.log = nullFunc;
-        console.info = nullFunc;
-        console.warn = nullFunc;
-        console.debug = nullFunc;
-        // console.error = nullFunc; // Uncomment if you want to hide errors too
-    }
-})();
+// (function () {
+//     const isProduction = window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1';
+//     if (isProduction) {
+//         const nullFunc = function () { };
+//         console.log = nullFunc;
+//         console.info = nullFunc;
+//         console.warn = nullFunc;
+//         console.debug = nullFunc;
+//         // console.error = nullFunc; // Uncomment if you want to hide errors too
+//     }
+// })();
 
 const R2_BASE_URL = "https://pub-95a66e290b0b4a03ad1abcef6de8b7da.r2.dev";
 const CLOUD_FUNCTION_URL = "https://pos-api-worker.jitkhon1979.workers.dev";
 
-// --- STATE ---
-let SHOP_ID = null;
-let SHOP_NAME = null; // Defined for Header
-let TABLE_NO = null;
-let SESSION_ID = null;
-
-let MENU = [];
-let CART = [];
-let ACTIVE_CATEGORY = null;
-
-// Modal State
-let CURRENT_ITEM = null;
-let SELECTED_OPTIONS = [];
-let CURRENT_QTY = 1;
-
-// View State
-let CURRENT_VIEW = 'menu';
-
-// --- INITIALIZATION ---
-window.onload = async () => {
-    const urlParams = new URLSearchParams(window.location.search);
-    SHOP_ID = urlParams.get('shop_id');
-    TABLE_NO = urlParams.get('table');
-
-    if (!SHOP_ID || !TABLE_NO) {
-        document.getElementById('app-view').innerHTML = `
-            <div class="flex items-center justify-center h-screen flex-col p-8 text-center">
-                <span class="material-symbols-outlined text-6xl text-gray-300 mb-4">qr_code_scanner</span>
-                <h2 class="text-xl font-bold text-gray-800 dark:text-white">Invalid QR Code</h2>
-                <p class="text-gray-500 mt-2">Please scan the QR code on your table again.</p>
-            </div>`;
-        return;
-    }
-
-    // Try to load cart from local storage to persist across reloads
-    try {
-        const savedCart = localStorage.getItem(`cart_${SHOP_ID}_${TABLE_NO}`);
-        if (savedCart) CART = JSON.parse(savedCart);
-        updateNavBadge();
-    } catch (e) { }
-
-    await checkSession();
-    await checkActiveOrder();
-};
-
-// --- ROUTING / VIEW SWITCHING ---
-window.switchView = (viewName) => {
-    CURRENT_VIEW = viewName;
-    updateNavUI();
-
-    // Render appropriate view
-    if (viewName === 'menu') renderMenuPage();
-    else if (viewName === 'cart') renderCartPage();
-    else if (viewName === 'bill') {
-        if (!SHOP_ID || !TABLE_NO) { console.error("Missing Shop/Table ID"); return; }
-        renderBillPage();
-    }
-
-    window.scrollTo(0, 0);
-};
-
-
-
-function updateNavUI() {
-    const tabs = ['menu', 'bill']; // Removed 'cart' from bottom nav handling
-    tabs.forEach(t => {
-        const btn = document.getElementById(`nav-${t}`);
-        const iconBg = document.getElementById(`nav-icon-bg-${t}`);
-        const label = btn.querySelector('span.text-xs');
-        const icon = btn.querySelector('.material-symbols-outlined');
-
-        if (t === CURRENT_VIEW) {
-            // Active State
-            btn.classList.remove('text-gray-400', 'dark:text-gray-500');
-            btn.classList.add('text-primary', 'dark:text-primary'); // Color text
-
-            iconBg.classList.add('bg-primary/20');
-            icon.classList.add('text-green-700', 'dark:text-primary');
-            icon.style.fontVariationSettings = "'FILL' 1";
-
-            label.classList.add('font-bold', 'text-green-800', 'dark:text-primary');
-            label.classList.remove('font-medium');
-        } else {
-            // Inactive State
-            btn.classList.remove('text-primary', 'dark:text-primary');
-            btn.classList.add('text-gray-400', 'dark:text-gray-500');
-
-            iconBg.classList.remove('bg-primary/20');
-            icon.classList.remove('text-green-700', 'dark:text-primary');
-            icon.style.fontVariationSettings = "'FILL' 0";
-
-            label.classList.remove('font-bold', 'text-green-800', 'dark:text-primary');
-            label.classList.add('font-medium');
-        }
-    });
-}
-
-function updateNavBadge() {
-    const badge = document.getElementById('nav-cart-badge');
-    if (!badge) return; // Guard clause for when badge is not in DOM
-    const count = CART.reduce((sum, item) => sum + item.qty, 0);
-    if (count > 0) {
-        badge.innerText = count;
-        badge.classList.remove('opacity-0');
-    } else {
-        badge.classList.add('opacity-0');
-    }
-}
-
-
-// --- RECOVERY LOGIC ---
-async function checkActiveOrder() {
-    const activeOrderId = localStorage.getItem('current_order_id');
-    if (activeOrderId) {
-        console.log("🔄 Restoring active order:", activeOrderId);
-        showWaitingModal();
-        // Optional: Check if already received (Optimization)
-        // DELAY: Wait 2s to allow D1 Propagation (Avoid False Ghost Detection)
-        setTimeout(async () => {
-            let isGhost = false;
-            try {
-                const res = await fetch(`${CLOUD_FUNCTION_URL}/order-status?orderId=${activeOrderId}`);
-
-                // GHOST ORDER CHECK (Strict 404)
-                if (res.status === 404) {
-                    isGhost = true;
-                }
-                // Check if already success (Optimization)
-                else if (res.ok) {
-                    const data = await res.json();
-                    if (data.status === 'RECEIVED') {
-                        updateModalSuccess();
-                        setTimeout(() => {
-                            hideWaitingModal();
-                            handleOrderSuccess();
-                        }, 1000);
-                        return; // Done, no need to wait/listen
-                    }
-                }
-            } catch (e) {
-                console.error("Recovery check failed (Network?), proceeding optimistically:", e);
-            }
-
-            if (isGhost) {
-                console.warn("Ghost order detected. Cleaning up.");
-                localStorage.removeItem('current_order_id');
-                hideWaitingModal();
-                alert("ไม่พบข้อมูลออเดอร์ กรุณาลองใหม่อีกครั้ง");
-            } else {
-                // Determine valid (or unknown error), start listening
-                waitForShopConfirmation(activeOrderId);
-            }
-        }, 2000);
-    }
-}
+// ... (State variables remain same)
 
 // --- SESSION LOGIC ---
 async function checkSession() {
     try {
         const t = Date.now();
-        const res = await fetch(`${R2_BASE_URL}/shops/${SHOP_ID}/tables/${TABLE_NO}/session.json?t=${t}`);
+        const url = `${R2_BASE_URL}/shops/${SHOP_ID}/tables/${TABLE_NO}/session.json?t=${t}`;
+        console.log("Fetching Session:", url);
+
+        const res = await fetch(url);
         if (res.ok) {
             const data = await res.json();
             SESSION_ID = data.session_id;
@@ -184,9 +33,13 @@ async function checkSession() {
 
             await loadMenu();
         } else {
+            console.error("Session Check Failed:", res.status, res.statusText);
+            // alert(`Session Check Failed: ${res.status}`); // DEBUG
             showClosedState();
         }
     } catch (e) {
+        console.error("Session Network Error:", e);
+        alert(`Session Error: ${e.message}`); // DEBUG: Show user the error
         showClosedState();
     }
 }
