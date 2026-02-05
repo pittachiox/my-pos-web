@@ -17,15 +17,24 @@ const CLOUD_FUNCTION_URL = "https://pos-api-worker.jitkhon1979.workers.dev";
 // ... (State variables remain same)
 
 // --- SESSION LOGIC ---
+// --- SESSION LOGIC ---
 async function checkSession() {
     try {
         const t = Date.now();
         const url = `${R2_BASE_URL}/shops/${SHOP_ID}/tables/${TABLE_NO}/session.json?t=${t}`;
-        console.log("Fetching Session:", url);
+
+        // 🔥 AGGRESSIVE DEBUG LOGS 🔥
+        console.log('🔥 TARGET URL:', url);
+        console.log('👀 PARAMS:', { SHOP_ID, TABLE_NO });
+        console.log('🚀 Starting Fetch...');
 
         const res = await fetch(url);
+
+        console.log('📬 Response Status:', res.status, res.statusText);
+
         if (res.ok) {
             const data = await res.json();
+            console.log('✅ Session Data:', data);
             SESSION_ID = data.session_id;
 
             // Show Bottom Nav if session valid
@@ -33,13 +42,13 @@ async function checkSession() {
 
             await loadMenu();
         } else {
-            console.error("Session Check Failed:", res.status, res.statusText);
-            // alert(`Session Check Failed: ${res.status}`); // DEBUG
+            console.error('❌ Session Check Failed (Status):', res.status);
+            // alert(`Session Check Failed: ${res.status}`); // Keep alert for visibility if needed
             showClosedState();
         }
     } catch (e) {
-        console.error("Session Network Error:", e);
-        alert(`Session Error: ${e.message}`); // DEBUG: Show user the error
+        console.error('❌ FETCH ERROR (Catch):', e);
+        alert(`Session Error: ${e.message}\nCheck Console for details.`);
         showClosedState();
     }
 }
