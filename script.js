@@ -11,11 +11,34 @@
 //     }
 // })();
 
-const R2_BASE_URL = "https://pub-95a66e290b0b4a03ad1abcef6de8b7da.r2.dev";
-const CLOUD_FUNCTION_URL = "https://pos-api-worker.jitkhon1979.workers.dev";
+// ======== LOCAL DEVELOPMENT CONFIGURATION ========
+// Uncomment the LOCAL lines below and comment the PRODUCTION lines for local development
+
+// PRODUCTION URLs
+// const R2_BASE_URL = "https://pub-95a66e290b0b4a03ad1abcef6de8b7da.r2.dev";
+// const CLOUD_FUNCTION_URL = "https://pos-api-worker.jitkhon1979.workers.dev";
+
+// LOCAL DEVELOPMENT URLs
+const R2_BASE_URL = `http://${window.location.hostname}:8787/r2`;
+const CLOUD_FUNCTION_URL = `http://${window.location.hostname}:8787`;
+
 console.log("🚀 VERSION: GitHub Pages - Fixed CORS & Paths");
 
-// ... (State variables remain same)
+// --- APP STATE ---
+const _params = new URLSearchParams(window.location.search);
+const SHOP_ID = _params.get('shop_id') || '';
+const TABLE_NO = _params.get('table') || _params.get('table_id') || _params.get('tableNo') || '';
+const INITIAL_VIEW = _params.get('view') || 'menu';
+
+let MENU = [];
+let CART = [];
+let SHOP_NAME = '';
+let SESSION_ID = null;
+let ACTIVE_VIEW = INITIAL_VIEW;
+let ACTIVE_CATEGORY = null;
+let CURRENT_ITEM = null;
+let CURRENT_QTY = 1;
+let SELECTED_OPTIONS = [];
 
 // --- SESSION LOGIC ---
 // --- SESSION LOGIC ---
@@ -184,7 +207,7 @@ async function loadMenu() {
             else if (data.items && data.items.length > 0 && data.items[0].items) MENU = data.items;
             else MENU = [{ id: 'default', name: 'General', items: data.items || [] }];
 
-            switchView('menu'); // Initial View
+            switchView(ACTIVE_VIEW); // Initial View
         } else {
             throw new Error("Menu file not found");
         }
@@ -286,6 +309,55 @@ function renderMenuPage() {
     `;
 
     document.getElementById('app-view').innerHTML = html;
+}
+
+function switchView(view) {
+    ACTIVE_VIEW = view;
+
+    if (view === 'cart') {
+        renderCartPage();
+    } else if (view === 'bill') {
+        renderBillPage();
+    } else {
+        renderMenuPage();
+    }
+
+    updateBottomNavActive(view);
+    updateNavBadge();
+}
+
+function updateBottomNavActive(view) {
+    const menuBtn = document.getElementById('nav-menu');
+    const billBtn = document.getElementById('nav-bill');
+    const menuBg = document.getElementById('nav-icon-bg-menu');
+    const billBg = document.getElementById('nav-icon-bg-bill');
+
+    if (!menuBtn || !billBtn || !menuBg || !billBg) return;
+
+    menuBtn.className = 'flex flex-col items-center gap-1 w-16 group transition-colors';
+    billBtn.className = 'flex flex-col items-center gap-1 w-16 group transition-colors';
+    menuBg.className = 'px-4 py-1 flex items-center justify-center rounded-full transition-colors';
+    billBg.className = 'px-4 py-1 flex items-center justify-center rounded-full transition-colors';
+
+    if (view === 'bill') {
+        billBtn.classList.add('text-zinc-900', 'dark:text-white');
+        menuBtn.classList.add('text-gray-400', 'dark:text-gray-500');
+        billBg.classList.add('bg-primary', 'text-[#121811]');
+    } else {
+        menuBtn.classList.add('text-zinc-900', 'dark:text-white');
+        billBtn.classList.add('text-gray-400', 'dark:text-gray-500');
+        menuBg.classList.add('bg-primary', 'text-[#121811]');
+    }
+}
+
+function updateNavBadge() {
+    const badge = document.getElementById('nav-cart-badge');
+    if (!badge) return;
+
+    const count = CART.reduce((sum, item) => sum + item.qty, 0);
+    badge.textContent = String(count);
+    if (count > 0) badge.classList.remove('opacity-0');
+    else badge.classList.add('opacity-0');
 }
 
 function setActiveCategory(sysId) {
@@ -687,6 +759,7 @@ async function placeOrder() {
             await trySend(payload);
 
             // CHANGED: Wait for Shop Confirmation (Modal is already Open)
+            // ← รอการยืนยันจาก SSE polling database
             waitForShopConfirmation(orderId);
             return;
         } catch (e) {
@@ -711,6 +784,7 @@ async function placeOrder() {
             // ... Phase 2 Logic ...
             showWaitingModal(); // Ensure it's back up
             await trySend(payload);
+            // Wait for shop confirmation
             waitForShopConfirmation(orderId);
             return;
         } catch (e) {
@@ -841,7 +915,11 @@ async function renderBillPage() {
     try {
         console.log("Fetching bill for:", { shopId: SHOP_ID, tableId: TABLE_NO });
 
-        const url = `${CLOUD_FUNCTION_URL}/orders?shop_id=${SHOP_ID}&table_id=${TABLE_NO}`;
+        const query = new URLSearchParams({
+            shop_id: SHOP_ID,
+            table_id: TABLE_NO,
+        });
+        const url = `${CLOUD_FUNCTION_URL}/orders?${query.toString()}`;
         console.log("URL:", url);
 
         const res = await fetch(url);
@@ -917,7 +995,7 @@ async function renderBillPage() {
                          <span class="text-gray-600 dark:text-gray-300">ยอดรวมทั้งหมด</span>
                          <span class="text-2xl font-bold text-primary">฿${grandTotal}</span>
                     </div>
-                    <button class="w-full bg-black dark:bg-white text-white dark:text-black font-bold py-3 rounded-xl">
+                    <button onclick="requestService('CHECK_BILL')" class="w-full bg-black dark:bg-white text-white dark:text-black font-bold py-3 rounded-xl">
                         เรียกเช็คบิล (Call Bill)
                     </button>
                  </footer>
@@ -974,4 +1052,28 @@ window.requestService = async (type) => {
     }
 };
 
-console.log("TEST UPDATE 123");
+// --- BOOTSTRAP ---
+(function initApp() {
+    const root = document.getElementById('app-view');
+
+    if (!SHOP_ID || !TABLE_NO) {
+        root.innerHTML = `
+            <div class="flex flex-col items-center justify-center h-screen p-8 text-center">
+                <span class="material-symbols-outlined text-6xl text-gray-300 mb-4">qr_code_2</span>
+                <h2 class="text-xl font-bold text-gray-800 dark:text-white">ลิงก์ไม่ครบ</h2>
+                <p class="text-gray-500 mt-2">ต้องมีทั้ง shop_id และ table</p>
+                <p class="text-xs text-gray-400 mt-2">ตัวอย่าง: ?shop_id=shop_xxx&table=A1</p>
+            </div>
+        `;
+        return;
+    }
+
+    try {
+        const raw = localStorage.getItem(`cart_${SHOP_ID}_${TABLE_NO}`);
+        CART = raw ? JSON.parse(raw) : [];
+    } catch (e) {
+        CART = [];
+    }
+
+    checkSession();
+})();
