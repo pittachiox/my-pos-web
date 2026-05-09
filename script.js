@@ -121,26 +121,23 @@ async function requestOpen() {
 function startPollingCountdown() {
     if (POLL_ATTEMPTS <= 0) { showRetryUI(); return; }
 
-    let timeLeft = 10;
+    let timeLeft = 5; // Polling interval changed to 5 seconds
     const ui = document.getElementById('closed-state-ui');
 
-    // Render Countdown UI
-    const renderTimer = () => {
+    // Render Waiting UI (No numbers, just spinner)
+    const renderWaitingUI = () => {
         ui.innerHTML = `
             <div class="flex flex-col items-center">
-                <span class="material-symbols-outlined text-6xl text-gray-300 mb-4">hourglass_top</span>
-                <h2 class="text-xl font-bold dark:text-white">รอสักครู่...</h2>
-                <p class="text-primary font-bold text-2xl mt-2">${timeLeft}</p>
-                <p class="text-gray-400 text-xs mt-1">กำลังเช็คสถานะ (รอบที่ ${4 - POLL_ATTEMPTS}/3)</p>
+                <div class="animate-spin h-16 w-16 border-4 border-primary border-t-transparent rounded-full mb-6"></div>
+                <h2 class="text-xl font-bold dark:text-white">กำลังตรวจสอบสถานะโต๊ะ...</h2>
+                <p class="text-gray-500 dark:text-gray-400 mt-2 text-sm text-center px-6">ทางร้านกำลังเตรียมโต๊ะให้ท่าน <br/>กรุณารอสักครู่ระบบจะพาเข้าหน้าเมนูอัตโนมัติ</p>
             </div>
         `;
     };
-    renderTimer();
+    renderWaitingUI();
 
     COUNTDOWN_INTERVAL = setInterval(() => {
         timeLeft--;
-        if (document.getElementById('closed-state-ui')) renderTimer(); // Update only if UI exists
-
         if (timeLeft <= 0) {
             clearInterval(COUNTDOWN_INTERVAL);
             performOneCheck();
@@ -195,7 +192,8 @@ async function loadMenu() {
     // But good practice -> remove it for menu. Keep for session.
 
     try {
-        const res = await fetch(`${R2_BASE_URL}/shops/${SHOP_ID}/menu.json`);
+        const t = Date.now();
+        const res = await fetch(`${R2_BASE_URL}/shops/${SHOP_ID}/menu.json?t=${t}`);
         if (res.ok) {
             const data = await res.json();
 
@@ -685,31 +683,43 @@ window.updateCartQty = (idx, delta) => {
     renderCartPage();
 };
 
+// Global lock — prevents ANY duplicate submission within the same session
+let ORDER_LOCKED = false;
+
 async function placeOrder() {
     if (!SESSION_ID) { alert("Session invalid."); return; }
+
+    // 🔒 LOCK IMMEDIATELY — this is the single source of truth
+    if (ORDER_LOCKED) {
+        console.log("⛔ Order already submitted. Ignoring duplicate tap.");
+        return;
+    }
+    ORDER_LOCKED = true;
+
+    // Disable the button right away for visual feedback
+    const btn = document.querySelector('button[onclick="placeOrder()"]');
+    if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
 
     const totalVal = CART.reduce((sum, item) => {
         const itemTotal = item.price + item.options.reduce((oSum, opt) => oSum + opt.price, 0);
         return sum + (itemTotal * item.qty);
     }, 0);
 
-    // Generate Request UUID (Deduplication Key)
+    // Generate Request UUID (Deduplication Key on backend too)
     const orderId = `ord_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-    // IMMEDIATE SAVE: Persist state before doing any heavy lifting
     localStorage.setItem('current_order_id', orderId);
 
     const payload = {
-        type: "PLACE_ORDER", // Updated Type
+        type: "PLACE_ORDER",
         shopId: SHOP_ID,
         sessionId: SESSION_ID,
-        orderId: orderId,    // Unique ID
+        orderId: orderId,
         orderData: {
             shopId: SHOP_ID,
             table: TABLE_NO,
             total: totalVal,
             timestamp: Date.now(),
-            orderId: orderId, // Also inside data for reference
+            orderId: orderId,
             items: CART.map(c => ({
                 id: c.id,
                 name: c.name,
@@ -722,81 +732,50 @@ async function placeOrder() {
         }
     };
 
-    // (Available for other logic if needed)
-
-    const btn = document.querySelector('button[onclick="placeOrder()"]');
-    if (btn) { btn.innerText = "กำลังส่ง..."; btn.disabled = true; }
-
-    // Retry Loop Configuration (Aggressive Strategy)
-    const PHASE1_RETRIES = 15;
-    const PHASE1_DELAY = 5000; // 5 seconds
-
-    const PHASE2_DELAY_BEFORE_START = 60000; // 1 minute ("นานๆ")
-    const PHASE2_RETRIES = 5;
-    const PHASE2_DELAY = 5000;
-
-    // Helper to attempt sending
-    const trySend = async (orderPayload) => {
-        const res = await fetch(CLOUD_FUNCTION_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(orderPayload)
-        });
-        if (!res.ok) throw new Error(`Status ${res.status}`);
-        return true;
-    };
-
-    // --- PHASE 1 ---
-
-    // CHANGED: Show Modal IMMEDIATELY (UX: Instant Feedback)
+    // Show waiting modal immediately
     showWaitingModal();
 
-    for (let attempt = 1; attempt <= PHASE1_RETRIES; attempt++) {
+    // Reduced retries — backend deduplication handles the rest
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 2000;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
-            console.log(`Sending Order (Phase 1: ${attempt}/${PHASE1_RETRIES})...`);
-            // if (btn) btn.innerText = `กำลังส่ง (${attempt}/${PHASE1_RETRIES})...`; // Modal covers this now
+            console.log(`Sending Order (Attempt: ${attempt}/${MAX_RETRIES})...`);
+            const res = await fetch(CLOUD_FUNCTION_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
 
-            await trySend(payload);
+            if (!res.ok) throw new Error(`Status ${res.status}`);
 
-            // CHANGED: Wait for Shop Confirmation (Modal is already Open)
-            // ← รอการยืนยันจาก SSE polling database
+            // ✅ Server received the order — show success immediately
+            console.log("✅ Order sent successfully!");
+            updateModalSuccess();
+
+            // Also listen for shop ACK in background
             waitForShopConfirmation(orderId);
+
+            // Auto-dismiss after 2.5s and clear cart
+            setTimeout(() => {
+                hideWaitingModal();
+                handleOrderSuccess();
+                ORDER_LOCKED = false; // Reset lock after full success
+            }, 2500);
             return;
+
         } catch (e) {
-            // If failed, maybe hide modal or update text? For now, we retry quietly or just log
-            console.error(`Phase 1 Attempt ${attempt} failed:`, e);
-            if (attempt < PHASE1_RETRIES) await new Promise(r => setTimeout(r, PHASE1_DELAY));
+            console.error(`Attempt ${attempt} failed:`, e);
+            if (attempt < MAX_RETRIES) await new Promise(r => setTimeout(r, RETRY_DELAY));
         }
     }
 
-    // If we exit loop without return, Phase 1 Failed completely
-    hideWaitingModal(); // Hide before Phase 2 prompt (or keep it?)
-    // Actually existing logic has a pause...
-
-    // --- PAUSE ("ไม่ได้ส่งอะไรนานๆ") ---
-    console.log("Phase 1 failed. Waiting for Phase 2...");
-    if (btn) btn.innerText = "ระบบกำลังพยายามเชื่อมต่อ...";
-    await new Promise(r => setTimeout(r, PHASE2_DELAY_BEFORE_START));
-
-    // --- PHASE 2 (Resend Everything "Recheck") ---
-    for (let attempt = 1; attempt <= PHASE2_RETRIES; attempt++) {
-        try {
-            // ... Phase 2 Logic ...
-            showWaitingModal(); // Ensure it's back up
-            await trySend(payload);
-            // Wait for shop confirmation
-            waitForShopConfirmation(orderId);
-            return;
-        } catch (e) {
-            console.error(`Phase 2 Attempt ${attempt} failed:`, e);
-            if (attempt < PHASE2_RETRIES) await new Promise(r => setTimeout(r, PHASE2_DELAY));
-        }
-    }
-
-    // Final Failure
+    // All retries failed
     hideWaitingModal();
-    alert("ไม่สามารถส่งออเดอร์ได้ กรุณาแคปหน้าจอแล้วแจ้งพนักงาน");
-    if (btn) { btn.innerText = "ลองใหม่อีกครั้ง"; btn.disabled = false; }
+    ORDER_LOCKED = false; // Unlock so user can try again
+    if (btn) { btn.disabled = false; btn.style.opacity = ''; }
+    alert("ไม่สามารถส่งออเดอร์ได้ กรุณาตรวจสอบ internet แล้วลองใหม่");
 }
 
 function handleOrderSuccess() {
