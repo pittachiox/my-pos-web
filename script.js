@@ -19,8 +19,8 @@
 // const CLOUD_FUNCTION_URL = "https://pos-api-worker.jitkhon1979.workers.dev";
 
 // LOCAL DEVELOPMENT URLs
-const R2_BASE_URL = `http://${window.location.hostname}:8787/r2`;
-const CLOUD_FUNCTION_URL = `http://${window.location.hostname}:8787`;
+const R2_BASE_URL = `http://192.168.1.119:8787/r2`;
+const CLOUD_FUNCTION_URL = `http://192.168.1.119:8787`;
 
 console.log("🚀 VERSION: GitHub Pages - Fixed CORS & Paths");
 
@@ -39,6 +39,133 @@ let ACTIVE_CATEGORY = null;
 let CURRENT_ITEM = null;
 let CURRENT_QTY = 1;
 let SELECTED_OPTIONS = [];
+
+// ======== GOOGLE SHEETS INTEGRATION ========
+const GS_CLIENT_ID = '20557328088-3aehln3fi9mpv2ij7fil3f0nq7bamogh.apps.googleusercontent.com';
+const GS_SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.profile';
+let gsTokenClient = null;
+let gsAccessToken = null;
+let gsSheetId = localStorage.getItem('pos_sheet_id') || null;
+let gsUserInfo = null;
+let BILL_ORDERS = [];
+
+function initGoogleSheets() {
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.onload = () => {
+        try {
+            gsTokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: GS_CLIENT_ID,
+                scope: GS_SCOPES,
+                callback: (response) => {
+                    if (response.error) {
+                        console.error('Google login error:', response.error);
+                        return;
+                    }
+                    gsAccessToken = response.access_token;
+                    gsGetUserInfo();
+                }
+            });
+            updateGoogleLoginButton();
+        } catch (e) {
+            console.error('Google Sheets init failed:', e);
+        }
+    };
+    document.head.appendChild(script);
+}
+
+async function gsGetUserInfo() {
+    try {
+        const res = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+            headers: { Authorization: `Bearer ${gsAccessToken}` }
+        });
+        gsUserInfo = await res.json();
+        if (gsUserInfo.error) { gsUserInfo = null; return; }
+        console.log('Google logged in:', gsUserInfo.name);
+        gsEnsureSheet();
+        updateGoogleLoginButton();
+    } catch (e) {
+        console.error('Google user info failed:', e);
+    }
+}
+
+async function gsEnsureSheet() {
+    if (gsSheetId || !gsAccessToken) return;
+    try {
+        const res = await fetch('https://sheets.googleapis.com/v4/spreadsheets', {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${gsAccessToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                properties: { title: 'POS Order History' },
+                sheets: [{ properties: { title: 'Orders' } }]
+            })
+        });
+        const data = await res.json();
+        if (data.spreadsheetId) {
+            gsSheetId = data.spreadsheetId;
+            localStorage.setItem('pos_sheet_id', gsSheetId);
+            await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${gsSheetId}/values/Orders!A1:G1?valueInputOption=USER_ENTERED`, {
+                method: 'PUT',
+                headers: {
+                    Authorization: `Bearer ${gsAccessToken}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ values: [['Order ID', 'Date', 'Shop', 'Table', 'Items', 'Total', 'Status']] })
+            });
+            console.log('Google Sheet created:', gsSheetId);
+        }
+    } catch (e) {
+        console.error('Failed to create sheet:', e);
+    }
+}
+
+async function gsWriteOrders(orders) {
+    if (!gsAccessToken || !gsSheetId || !orders.length) return;
+    try {
+        const rows = orders.map(order => {
+            let od = {};
+            try { od = JSON.parse(order.order_data); } catch (e) {}
+            const itemsStr = (od.items || []).map(i => `${i.qty}x ${i.name}`).join(', ');
+            return [
+                order.order_id,
+                new Date(order.created_at).toLocaleString('th-TH'),
+                od.shopId || SHOP_ID,
+                od.table || TABLE_NO,
+                itemsStr,
+                od.total || 0,
+                order.status
+            ];
+        });
+        await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${gsSheetId}/values/Orders!A:G:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${gsAccessToken}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({ values: rows })
+        });
+        console.log('Orders written to Google Sheet');
+    } catch (e) {
+        console.error('Failed to write to Sheet:', e);
+    }
+}
+
+function updateGoogleLoginButton() {
+    const btn = document.getElementById('google-login-btn');
+    if (!btn) return;
+    if (gsUserInfo) {
+        btn.innerHTML = `<img src="${gsUserInfo.picture}" class="w-6 h-6 rounded-full">`;
+        btn.title = `บันทึกประวัติ: ${gsUserInfo.name}`;
+        btn.onclick = null;
+    } else {
+        btn.innerHTML = `<span class="material-symbols-outlined" style="font-size:20px">person</span>`;
+        btn.title = 'ล็อกอินเพื่อบันทึกประวัติออเดอร์';
+        btn.onclick = () => gsTokenClient && gsTokenClient.requestAccessToken();
+    }
+}
 
 // --- SESSION LOGIC ---
 // --- SESSION LOGIC ---
@@ -181,6 +308,23 @@ function showRetryUI() {
 }
 
 // --- MENU DATA ---
+async function refreshMenuData() {
+    try {
+        const t = Date.now();
+        const res = await fetch(`${R2_BASE_URL}/shops/${SHOP_ID}/menu.json?t=${t}`);
+        if (res.ok) {
+            const data = await res.json();
+            if (data.categories) MENU = data.categories;
+            else if (data.items && data.items.length > 0 && data.items[0].items) MENU = data.items;
+            else MENU = [{ id: 'default', name: 'General', items: data.items || [] }];
+            return true;
+        }
+    } catch (e) {
+        console.error("Silent menu refresh failed:", e);
+    }
+    return false;
+}
+
 async function loadMenu() {
     // Remove ?t=... to allow caching as requested
     // const res = await fetch(`${R2_BASE_URL}/shops/${SHOP_ID}/menu.json`); 
@@ -229,6 +373,38 @@ async function loadMenu() {
 
 // --- VIEW RENDERERS ---
 
+// --- AVAILABILITY HELPERS ---
+function findMenuItem(itemId) {
+    for (const cat of MENU) {
+        const item = cat.items.find(i => i.id === itemId);
+        if (item) return item;
+    }
+    return null;
+}
+
+function checkCartAvailability() {
+    let allAvailable = true;
+    for (const cartItem of CART) {
+        const menuItem = findMenuItem(cartItem.id);
+        if (!menuItem || menuItem.isAvailable === false) {
+            cartItem.error = "สินค้าหมด";
+            allAvailable = false;
+        } else {
+            // Check options
+            for (const cartOpt of cartItem.options) {
+                const menuOpt = (menuItem.options || []).find(o => o.name === cartOpt.name);
+                if (menuOpt && menuOpt.isAvailable === false) {
+                    cartItem.error = "ตัวเลือกหมด";
+                    allAvailable = false;
+                    break;
+                }
+            }
+            if (!cartItem.error) delete cartItem.error;
+        }
+    }
+    return allAvailable;
+}
+
 // 1. MENU PAGE
 function renderMenuPage() {
     if (!MENU.length || (MENU.length === 1 && MENU[0].items.length === 0)) {
@@ -262,7 +438,10 @@ function renderMenuPage() {
                         </div>
                     </div>
                 </div>
-                <div class="flex w-12 items-center justify-end">
+                <div class="flex items-center gap-2">
+                    <button id="google-login-btn" class="relative flex items-center justify-center rounded-full w-10 h-10 bg-white dark:bg-gray-800 shadow-sm text-gray-400 hover:text-primary transition-colors">
+                        <span class="material-symbols-outlined" style="font-size:20px">person</span>
+                    </button>
                     <button onclick="switchView('cart')" class="relative flex items-center justify-center rounded-full w-10 h-10 bg-white dark:bg-gray-800 shadow-sm text-[#121811] dark:text-white hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
                         <span class="material-symbols-outlined" style="font-size: 24px;">shopping_basket</span>
                         ${(() => {
@@ -369,15 +548,18 @@ function renderActiveCategoryItems() {
     const category = MENU.find(c => c.id === ACTIVE_CATEGORY);
     if (!category) return '<p class="text-center text-gray-500">ไม่พบรายการ</p>';
 
-    return category.items.map(item => `
-        <div onclick='openItemDetail(${JSON.stringify(item).replace(/'/g, "&#39;")})' 
-             class="flex w-full items-center gap-4 bg-white dark:bg-gray-800 p-3 rounded-2xl shadow-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-750 transition-colors">
+    return category.items.map(item => {
+        const soldOut = item.isAvailable === false;
+        return `
+        <div onclick='${soldOut ? '' : 'openItemDetail(' + JSON.stringify(item).replace(/'/g, "&#39;") + ')'}' 
+             class="flex w-full items-center gap-4 bg-white dark:bg-gray-800 p-3 rounded-2xl shadow-sm ${soldOut ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-750'} transition-colors relative">
             <div class="relative w-24 h-24 shrink-0 rounded-xl overflow-hidden bg-gray-100">
                 ${item.imageUrl
             ? `<img src="${item.imageUrl}" class="w-full h-full object-cover" loading="lazy">`
             : `<div class="w-full h-full flex items-center justify-center text-gray-400"><span class="material-symbols-outlined">restaurant</span></div>`
         }
             </div>
+            ${soldOut ? '<span class="absolute top-2 right-2 bg-red-500 text-white text-xs font-bold px-2 py-1 rounded-full z-10">สินค้าหมด</span>' : ''}
             <div class="flex flex-col flex-1 h-24 justify-between py-1">
                 <div>
                     <h4 class="text-[#121811] dark:text-white text-base font-bold line-clamp-1">${item.name}</h4>
@@ -389,7 +571,8 @@ function renderActiveCategoryItems() {
                 </div>
             </div>
         </div>
-    `).join('');
+    `;
+    }).join('');
 }
 
 // 2. ITEM DETAIL (MODAL)
@@ -399,7 +582,7 @@ window.openItemDetail = (item) => {
     SELECTED_OPTIONS = [];
 
     // Safety for invalid options structure
-    const options = item.options || [];
+    const options = (item.options || []).filter(o => o.isAvailable !== false);
 
     const modal = document.getElementById('item-modal-container');
     modal.classList.remove('hidden');
@@ -530,6 +713,7 @@ function updateDetailTotal() {
 }
 
 window.confirmAddToCart = () => {
+    if (CURRENT_ITEM.isAvailable === false) return; // Sold-out guard
     // Note logic
     const noteEl = document.getElementById('item-note');
     const note = noteEl ? noteEl.value.trim() : '';
@@ -568,6 +752,9 @@ function saveCartLoal() {
 
 // 3. CART PAGE
 function renderCartPage() {
+    // Check availability against current MENU
+    const hasSoldOut = !checkCartAvailability();
+
     const subtotal = CART.reduce((sum, item) => {
         return sum + ((item.price + item.options.reduce((s, o) => s + o.price, 0)) * item.qty);
     }, 0);
@@ -593,7 +780,7 @@ function renderCartPage() {
                         ${CART.map((item, idx) => {
         const itemTotal = (item.price + item.options.reduce((s, o) => s + o.price, 0)) * item.qty;
         return `
-                            <div class="bg-card-light dark:bg-card-dark rounded-xl p-4 shadow-soft flex gap-4 items-start">
+                            <div class="bg-card-light dark:bg-card-dark rounded-xl p-4 shadow-soft flex gap-4 items-start relative ${item.error ? 'opacity-60 ring-1 ring-red-500/30' : ''}">
                                 <div class="shrink-0 relative overflow-hidden rounded-lg w-20 h-20 bg-gray-200">
                                     ${item.imageUrl
                 ? `<div class="absolute inset-0 bg-cover bg-center" style='background-image: url("${item.imageUrl}");'></div>`
@@ -603,7 +790,10 @@ function renderCartPage() {
                                 <div class="flex-1 flex flex-col justify-between min-h-[5rem]">
                                     <div>
                                         <div class="flex justify-between items-start">
-                                            <h3 class="font-semibold text-zinc-900 dark:text-white text-[15px] leading-tight line-clamp-2">${item.name}</h3>
+                                            <h3 class="font-semibold text-zinc-900 dark:text-white text-[15px] leading-tight line-clamp-2">
+                                                ${item.name}
+                                                ${item.error ? `<span class="ml-2 inline-block bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded">${item.error}</span>` : ''}
+                                            </h3>
                                             <span class="font-semibold text-zinc-900 dark:text-white text-[15px]">฿${item.price}</span>
                                         </div>
                                         <div class="text-xs text-zinc-500 dark:text-zinc-400 mt-1 leading-relaxed">
@@ -620,7 +810,7 @@ function renderCartPage() {
                                                 <span class="material-symbols-outlined text-[16px]">remove</span>
                                             </button>
                                             <span class="font-medium text-sm w-4 text-center">${item.qty}</span>
-                                            <button onclick="updateCartQty(${idx}, 1)" class="w-7 h-7 flex items-center justify-center rounded-md bg-primary text-zinc-900 hover:bg-primary/90 shadow-sm">
+                                            <button onclick="updateCartQty(${idx}, 1)" class="w-7 h-7 flex items-center justify-center rounded-md bg-primary text-zinc-900 hover:bg-primary/90 shadow-sm ${item.error ? 'pointer-events-none opacity-50' : ''}">
                                                 <span class="material-symbols-outlined text-[16px]">add</span>
                                             </button>
                                         </div>
@@ -648,10 +838,13 @@ function renderCartPage() {
             <!-- Fixed Action Button -->
             ${CART.length > 0 ? `
             <div class="sticky bottom-[70px] w-full z-30 bg-white dark:bg-background-dark shadow-nav border-t border-zinc-100 dark:border-zinc-800 p-4">
-                <button onclick="placeOrder()" class="w-full bg-primary hover:bg-primary/90 active:scale-[0.98] transition-all duration-200 text-zinc-900 font-bold text-lg h-14 rounded-xl flex items-center justify-between px-6 shadow-lg shadow-primary/20">
-                    <span>สั่งอาหารเลย</span>
+                <button onclick="placeOrder()" 
+                    ${hasSoldOut ? 'disabled' : ''}
+                    class="w-full ${hasSoldOut ? 'bg-zinc-300 dark:bg-zinc-700 grayscale cursor-not-allowed' : 'bg-primary shadow-lg shadow-primary/20 hover:bg-primary/90'} active:scale-[0.98] transition-all duration-200 text-zinc-900 font-bold text-lg h-14 rounded-xl flex items-center justify-between px-6">
+                    <span>${hasSoldOut ? 'มีสินค้าบางอย่างหมด' : 'สั่งอาหารเลย'}</span>
                     <span class="bg-black/10 px-3 py-1 rounded-lg text-base">฿${total}</span>
                 </button>
+                ${hasSoldOut ? `<p class="text-center text-xs text-red-500 mt-2">กรุณาลบรายการที่สินค้าหมดออกก่อนสั่งซื้อ</p>` : ''}
             </div>
             ` : ''}
         </div>
@@ -696,9 +889,19 @@ async function placeOrder() {
     }
     ORDER_LOCKED = true;
 
-    // Disable the button right away for visual feedback
-    const btn = document.querySelector('button[onclick="placeOrder()"]');
-    if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
+    // 🔥 PRE-FLIGHT CHECK: Fetch latest menu data silently before validating cart
+    const refreshOk = await refreshMenuData();
+    if (!refreshOk) {
+        console.warn("Could not refresh menu data before ordering. Proceeding with caution...");
+    }
+
+    // Final availability check before sending
+    if (!checkCartAvailability()) {
+        alert("ขออภัย มีสินค้าบางรายการหมดกะทันหัน กรุณาตรวจสอบตะกร้าอีกครั้ง");
+        renderCartPage();
+        ORDER_LOCKED = false;
+        return;
+    }
 
     const totalVal = CART.reduce((sum, item) => {
         const itemTotal = item.price + item.options.reduce((oSum, opt) => oSum + opt.price, 0);
@@ -731,6 +934,10 @@ async function placeOrder() {
             }))
         }
     };
+
+    // Disable the button right away for visual feedback
+    const btn = document.querySelector('button[onclick="placeOrder()"]');
+    if (btn) { btn.disabled = true; btn.style.opacity = '0.6'; }
 
     // Show waiting modal immediately
     showWaitingModal();
@@ -777,6 +984,7 @@ async function placeOrder() {
     if (btn) { btn.disabled = false; btn.style.opacity = ''; }
     alert("ไม่สามารถส่งออเดอร์ได้ กรุณาตรวจสอบ internet แล้วลองใหม่");
 }
+
 
 function handleOrderSuccess() {
     try {
@@ -908,6 +1116,7 @@ async function renderBillPage() {
         console.log("Bill Data received:", data);
 
         const orders = data.orders || [];
+        BILL_ORDERS = orders;
 
         if (orders.length === 0) {
             document.getElementById('app-view').innerHTML = `
@@ -1013,6 +1222,12 @@ window.closeServiceModal = () => {
 window.requestService = async (type) => {
     // Optimistic Feedback (Fire and Forget)
     closeServiceModal();
+
+    // Write to Google Sheet on check bill (fire and forget)
+    if (type === 'CHECK_BILL' && gsAccessToken && BILL_ORDERS.length > 0) {
+        gsWriteOrders(BILL_ORDERS);
+    }
+
     alert("ส่งคำขอเรียบร้อยแล้ว พนักงานจะรีบมาให้บริการครับ");
 
     try {
@@ -1055,4 +1270,5 @@ window.requestService = async (type) => {
     }
 
     checkSession();
+    initGoogleSheets();
 })();
