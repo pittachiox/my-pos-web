@@ -19,8 +19,8 @@
 // const CLOUD_FUNCTION_URL = "https://pos-api-worker.jitkhon1979.workers.dev";
 
 // LOCAL DEVELOPMENT URLs
-const R2_BASE_URL = `http://192.168.1.119:8787/r2`;
-const CLOUD_FUNCTION_URL = `http://192.168.1.119:8787`;
+const R2_BASE_URL = `http://${window.location.hostname}:8787/r2`;
+const CLOUD_FUNCTION_URL = `http://${window.location.hostname}:8787`;
 
 console.log("🚀 VERSION: GitHub Pages - Fixed CORS & Paths");
 
@@ -963,6 +963,28 @@ async function placeOrder() {
 
             // Also listen for shop ACK in background
             waitForShopConfirmation(orderId);
+
+            // 🛒 Trigger Notification for Merchant (FCM via Worker)
+            try {
+                fetch(CLOUD_FUNCTION_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: 'NEW_ORDER',
+                        shopId: SHOP_ID,
+                        tableId: TABLE_NO,
+                        title: `🛒 ออเดอร์ใหม่: โต๊ะ ${TABLE_NO}`,
+                        body: `มีรายการสั่งอาหารใหม่ ${CART.length} รายการ`,
+                        orderData: JSON.stringify({
+                            items: CART,
+                            total: totalVal,
+                            timestamp: Date.now()
+                        })
+                    })
+                });
+            } catch (err) {
+                console.warn("Notification trigger failed:", err);
+            }
 
             // Auto-dismiss after 2.5s and clear cart
             setTimeout(() => {
